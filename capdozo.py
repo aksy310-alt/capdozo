@@ -9,6 +9,7 @@ import threading
 import io
 from datetime import datetime
 from pathlib import Path
+from collections import deque
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -18,6 +19,8 @@ try:
     import win32gui
     import win32con
     import win32api
+    import win32clipboard
+    from pynput import keyboard as pynput_keyboard
 except ImportError as e:
     print(f"必要なライブラリが不足しています: {e}")
     input("Enterキーで終了...")
@@ -39,6 +42,10 @@ DEFAULT_CONFIG = {
     "seq_start": 0,
     "use_timestamp": True,
     "format": "jpg",
+    "save_to_file": False,
+    "hotkey_fullscreen": "",
+    "hotkey_window": "",
+    "hotkey_rect": "",
 }
 
 FORMAT_EXT = {
@@ -46,6 +53,8 @@ FORMAT_EXT = {
     "png": (".png", "PNG"),
     "bmp": (".bmp", "BMP"),
 }
+
+clipboard_history = deque(maxlen=10)
 
 
 def load_config():
@@ -86,14 +95,31 @@ def get_save_path():
         return path
 
 
-def save_image(img):
-    path = get_save_path()
-    ext, fmt = FORMAT_EXT[config.get("format", "jpg")]
-    if fmt == "JPEG":
-        img.convert("RGB").save(path, fmt, quality=95)
-    else:
-        img.convert("RGB").save(path, fmt)
-    return path
+def copy_image_to_clipboard(img):
+    output = io.BytesIO()
+    img.convert("RGB").save(output, "BMP")
+    data = output.getvalue()[14:]
+    output.close()
+    win32clipboard.OpenClipboard()
+    win32clipboard.EmptyClipboard()
+    win32clipboard.SetClipboardData(win32con.CF_DIB, data)
+    win32clipboard.CloseClipboard()
+
+
+def process_capture(img):
+    thumb = img.copy()
+    thumb.thumbnail((200, 150))
+    ts = datetime.now().strftime("%H:%M:%S")
+    clipboard_history.appendleft({"image": img.copy(), "thumb": thumb, "time": ts})
+    copy_image_to_clipboard(img)
+    if config.get("save_to_file", False):
+        path = get_save_path()
+        ext, fmt = FORMAT_EXT[config.get("format", "jpg")]
+        if fmt == "JPEG":
+            img.convert("RGB").save(path, fmt, quality=95)
+        else:
+            img.convert("RGB").save(path, fmt)
+    flash_screen()
 
 
 def enable_dpi_aware():
@@ -127,23 +153,19 @@ def capture_fullscreen():
     width  = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
     height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
     img = ImageGrab.grab(bbox=(left, top, left + width, top + height), all_screens=True)
-    path = save_image(img)
-    flash_screen()
-    return path
+    process_capture(img)
 
 
 def capture_selected_window():
     hwnd = win32gui.GetForegroundWindow()
     if not hwnd:
-        return None
+        return
     rect = win32gui.GetWindowRect(hwnd)
     left, top, right, bottom = rect
     if right - left <= 0 or bottom - top <= 0:
-        return None
+        return
     img = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
-    path = save_image(img)
-    flash_screen()
-    return path
+    process_capture(img)
 
 
 class RectSelector:
@@ -166,28 +188,20 @@ class RectSelector:
         self.root.geometry(f"{self.vw}x{self.vh}+{self.vx}+{self.vy}")
 
         self.canvas = tk.Canvas(
-            self.root,
-            cursor="cross",
-            bg="black",
-            highlightthickness=0,
-            width=self.vw,
-            height=self.vh,
+            self.root, cursor="cross", bg="black",
+            highlightthickness=0, width=self.vw, height=self.vh,
         )
         self.canvas.pack(fill=tk.BOTH, expand=True)
-
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.root.bind("<Escape>", lambda e: self.cancel())
-
         self.root.mainloop()
 
     def on_press(self, event):
         self.start_x = self.root.winfo_pointerx()
         self.start_y = self.root.winfo_pointery()
-        self.rect_id = self.canvas.create_rectangle(
-            0, 0, 0, 0, outline="red", width=2, fill=""
-        )
+        self.rect_id = self.canvas.create_rectangle(0, 0, 0, 0, outline="red", width=2, fill="")
 
     def on_drag(self, event):
         cx = self.root.winfo_pointerx() - self.vx
@@ -214,12 +228,85 @@ class RectSelector:
 def capture_rect():
     def on_selected(left, top, right, bottom):
         img = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
-        save_image(img)
-        flash_screen()
+        process_capture(img)
     RectSelector(on_selected)
 
 
-def open_settings():
+def show_clipboard_history():
+    if not clipboard_history:
+        messagebox.showinfo("クリップボード履歴", "履歴がありません。")
+        return
+
+    win = tk.Tk()
+    win.title("クリップボード履歴")
+    win.attributes("-topmost", True)
+    win.resizable(False, False)
+
+    tk.Label(win, text="クリックで再コピー", fg="gray").pack(pady=(8, 2))
+
+    frame = tk.Frame(win)
+    frame.pack(padx=10, pady=10)
+
+    for i, item in enumerate(clipboard_history):
+        from PIL import ImageTk
+        tk_img = ImageTk.PhotoImage(item["thumb"].copy())
+
+        btn_frame = tk.Frame(frame, relief="ridge", bd=1)
+        btn_frame.grid(row=i // 5, column=i % 5, padx=4, pady=4)
+
+        def make_callback(img):
+            def callback():
+                copy_image_to_clipboard(img)
+                win.destroy()
+            return callback
+
+        btn = tk.Button(btn_frame, image=tk_img, command=make_callback(item["image"]))
+        btn.image = tk_img
+        btn.pack()
+        tk.Label(btn_frame, text=item["time"], font=("", 8)).pack()
+
+    tk.Button(win, text="閉じる", command=win.destroy, width=12).pack(pady=8)
+    win.mainloop()
+
+
+_hotkey_listener = None
+
+def setup_hotkeys():
+    global _hotkey_listener
+    if _hotkey_listener:
+        try:
+            _hotkey_listener.stop()
+        except Exception:
+            pass
+        _hotkey_listener = None
+
+    hotkeys = {}
+
+    def make_action(func):
+        def action():
+            threading.Thread(target=func, daemon=True).start()
+        return action
+
+    fs = config.get("hotkey_fullscreen", "")
+    wn = config.get("hotkey_window", "")
+    rc = config.get("hotkey_rect", "")
+
+    if fs:
+        hotkeys[fs] = make_action(capture_fullscreen)
+    if wn:
+        def window_with_delay():
+            time.sleep(0.5)
+            capture_selected_window()
+        hotkeys[wn] = make_action(window_with_delay)
+    if rc:
+        hotkeys[rc] = make_action(capture_rect)
+
+    if hotkeys:
+        _hotkey_listener = pynput_keyboard.GlobalHotKeys(hotkeys)
+        _hotkey_listener.start()
+
+
+def open_settings(icon):
     win = tk.Tk()
     win.title("キャプどうぞ 設定")
     win.resizable(False, False)
@@ -230,9 +317,17 @@ def open_settings():
     def g(row, col, **kw):
         return {"row": row, "column": col, "padx": px, "pady": py, **kw}
 
-    tk.Label(win, text="保存先フォルダ:").grid(**g(0, 0, sticky="w"))
+    # ファイル保存チェック
+    save_to_file_var = tk.BooleanVar(value=config.get("save_to_file", False))
+    tk.Checkbutton(
+        win, text="キャプチャをファイルに保存する",
+        variable=save_to_file_var, padx=6, pady=6
+    ).grid(**g(0, 0, columnspan=3, sticky="w"))
+
+    # 保存先
+    tk.Label(win, text="保存先フォルダ:").grid(**g(1, 0, sticky="w"))
     save_dir_var = tk.StringVar(value=config["save_dir"])
-    tk.Entry(win, textvariable=save_dir_var, width=42).grid(**g(0, 1, sticky="ew"))
+    tk.Entry(win, textvariable=save_dir_var, width=42).grid(**g(1, 1, sticky="ew"))
 
     def browse():
         win.update()
@@ -242,16 +337,18 @@ def open_settings():
         win.lift()
         win.focus_force()
 
-    tk.Button(win, text="  参照  ", command=browse).grid(**g(0, 2))
+    tk.Button(win, text="  参照  ", command=browse).grid(**g(1, 2))
 
-    tk.Label(win, text="接頭語:").grid(**g(1, 0, sticky="w"))
+    # 接頭語
+    tk.Label(win, text="接頭語:").grid(**g(2, 0, sticky="w"))
     prefix_var = tk.StringVar(value=config["prefix"])
-    tk.Entry(win, textvariable=prefix_var, width=22).grid(**g(1, 1, sticky="w"))
+    tk.Entry(win, textvariable=prefix_var, width=22).grid(**g(2, 1, sticky="w"))
 
-    tk.Label(win, text="出力形式:").grid(**g(2, 0, sticky="w"))
+    # 出力形式
+    tk.Label(win, text="出力形式:").grid(**g(3, 0, sticky="w"))
     format_var = tk.StringVar(value=config.get("format", "jpg"))
     fmt_frame = tk.Frame(win)
-    fmt_frame.grid(**g(2, 1, sticky="w"))
+    fmt_frame.grid(**g(3, 1, sticky="w"))
     for fmt in ["jpg", "png", "bmp"]:
         tk.Radiobutton(
             fmt_frame, text=f"  {fmt.upper()}  ",
@@ -259,32 +356,57 @@ def open_settings():
             indicatoron=True, padx=8, pady=6
         ).pack(side="left", padx=4)
 
+    # タイムスタンプ
     use_ts_var = tk.BooleanVar(value=config["use_timestamp"])
     tk.Checkbutton(
         win, text="タイムスタンプを使う（OFFで連番）",
         variable=use_ts_var, padx=6, pady=6
-    ).grid(**g(3, 0, columnspan=2, sticky="w"))
+    ).grid(**g(4, 0, columnspan=2, sticky="w"))
 
-    tk.Label(win, text="連番桁数:").grid(**g(4, 0, sticky="w"))
+    # 連番桁数
+    tk.Label(win, text="連番桁数:").grid(**g(5, 0, sticky="w"))
     digits_var = tk.IntVar(value=config["seq_digits"])
-    tk.Spinbox(win, from_=1, to=10, textvariable=digits_var, width=6).grid(**g(4, 1, sticky="w"))
+    tk.Spinbox(win, from_=1, to=10, textvariable=digits_var, width=6).grid(**g(5, 1, sticky="w"))
 
-    tk.Label(win, text="連番開始番号:").grid(**g(5, 0, sticky="w"))
+    # 連番開始番号
+    tk.Label(win, text="連番開始番号:").grid(**g(6, 0, sticky="w"))
     seq_var = tk.IntVar(value=config["seq_start"])
-    tk.Spinbox(win, from_=0, to=99999, textvariable=seq_var, width=9).grid(**g(5, 1, sticky="w"))
+    tk.Spinbox(win, from_=0, to=99999, textvariable=seq_var, width=9).grid(**g(6, 1, sticky="w"))
+
+    # ホットキー
+    tk.Label(win, text="── ホットキー設定 ──").grid(row=7, column=0, columnspan=3, pady=(12, 2))
+    tk.Label(win, text="例: <ctrl>+<shift>+f", fg="gray", font=("", 8)).grid(row=8, column=0, columnspan=3)
+
+    tk.Label(win, text="フルスクリーン:").grid(**g(9, 0, sticky="w"))
+    hk_fs_var = tk.StringVar(value=config.get("hotkey_fullscreen", ""))
+    tk.Entry(win, textvariable=hk_fs_var, width=22).grid(**g(9, 1, sticky="w"))
+
+    tk.Label(win, text="ウィンドウを選択:").grid(**g(10, 0, sticky="w"))
+    hk_wn_var = tk.StringVar(value=config.get("hotkey_window", ""))
+    tk.Entry(win, textvariable=hk_wn_var, width=22).grid(**g(10, 1, sticky="w"))
+
+    tk.Label(win, text="矩形選択:").grid(**g(11, 0, sticky="w"))
+    hk_rc_var = tk.StringVar(value=config.get("hotkey_rect", ""))
+    tk.Entry(win, textvariable=hk_rc_var, width=22).grid(**g(11, 1, sticky="w"))
 
     btn_frame = tk.Frame(win)
-    btn_frame.grid(row=6, column=0, columnspan=3, pady=12)
+    btn_frame.grid(row=12, column=0, columnspan=3, pady=12)
 
     def on_ok():
-        config["save_dir"]      = save_dir_var.get()
-        config["prefix"]        = prefix_var.get()
-        config["format"]        = format_var.get()
-        config["use_timestamp"] = use_ts_var.get()
-        config["seq_digits"]    = digits_var.get()
-        config["seq_start"]     = seq_var.get()
-        config["seq_current"]   = seq_var.get()
+        config["save_to_file"]      = save_to_file_var.get()
+        config["save_dir"]          = save_dir_var.get()
+        config["prefix"]            = prefix_var.get()
+        config["format"]            = format_var.get()
+        config["use_timestamp"]     = use_ts_var.get()
+        config["seq_digits"]        = digits_var.get()
+        config["seq_start"]         = seq_var.get()
+        config["seq_current"]       = seq_var.get()
+        config["hotkey_fullscreen"] = hk_fs_var.get()
+        config["hotkey_window"]     = hk_wn_var.get()
+        config["hotkey_rect"]       = hk_rc_var.get()
         save_config(config)
+        setup_hotkeys()
+        icon.update_menu()
         win.destroy()
 
     tk.Button(btn_frame, text="     OK     ", command=on_ok).pack(side="left", padx=12)
@@ -326,9 +448,6 @@ def toggle_startup(icon, item):
     threading.Thread(target=_toggle, daemon=True).start()
 
 
-
-
-
 def create_icon_image():
     try:
         img_data = base64.b64decode(ICON_B64)
@@ -344,6 +463,7 @@ def main():
         sys.exit(0)
 
     enable_dpi_aware()
+    setup_hotkeys()
 
     icon_image = create_icon_image()
 
@@ -362,10 +482,16 @@ def main():
         os.startfile(config["save_dir"])
 
     def do_settings(icon, item):
-        threading.Thread(target=open_settings, daemon=True).start()
+        threading.Thread(target=lambda: open_settings(icon), daemon=True).start()
+
+    def do_history(icon, item):
+        threading.Thread(target=show_clipboard_history, daemon=True).start()
 
     def startup_label(item):
         return "✅ スタートアップ登録済み" if is_startup_registered() else "🔁 スタートアップに登録"
+
+    def folder_visible(item):
+        return config.get("save_to_file", False)
 
     menu = pystray.Menu(
         pystray.MenuItem("⚙️  設定",                  do_settings),
@@ -374,7 +500,9 @@ def main():
         pystray.MenuItem("🪟 ウィンドウを選択",       do_selected_window),
         pystray.MenuItem("✂️  矩形選択",              do_rect),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("📁 保存フォルダを開く",     do_open_folder),
+        pystray.MenuItem("📁 保存フォルダを開く",     do_open_folder, visible=folder_visible),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("🕐 クリップボード履歴",     do_history),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(startup_label,              toggle_startup),
         pystray.Menu.SEPARATOR,
