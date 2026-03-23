@@ -56,6 +56,10 @@ FORMAT_EXT = {
 
 clipboard_history = deque(maxlen=10)
 
+# tkinterをメインスレッドで動かすためのキュー
+_tk_queue = []
+_tk_lock = threading.Lock()
+
 
 def load_config():
     if CONFIG_PATH.exists():
@@ -247,9 +251,11 @@ def show_clipboard_history():
     frame = tk.Frame(win)
     frame.pack(padx=10, pady=10)
 
+    from PIL import ImageTk
+    refs = []
     for i, item in enumerate(clipboard_history):
-        from PIL import ImageTk
         tk_img = ImageTk.PhotoImage(item["thumb"].copy())
+        refs.append(tk_img)
 
         btn_frame = tk.Frame(frame, relief="ridge", bd=1)
         btn_frame.grid(row=i // 5, column=i % 5, padx=4, pady=4)
@@ -270,6 +276,7 @@ def show_clipboard_history():
 
 
 _hotkey_listener = None
+
 
 def setup_hotkeys():
     global _hotkey_listener
@@ -307,24 +314,25 @@ def setup_hotkeys():
 
 
 def open_settings(icon):
-    win = tk.Tk()
+    """設定ウィンドウを開く（必ずメインスレッドから呼ぶこと）"""
+    win = tk.Toplevel()
     win.title("キャプどうぞ 設定")
     win.resizable(False, False)
     win.attributes("-topmost", True)
+    win.lift()
+    win.focus_force()
 
     px, py = 14, 8
 
     def g(row, col, **kw):
         return {"row": row, "column": col, "padx": px, "pady": py, **kw}
 
-    # ファイル保存チェック
     save_to_file_var = tk.BooleanVar(value=config.get("save_to_file", False))
     tk.Checkbutton(
         win, text="キャプチャをファイルに保存する",
         variable=save_to_file_var, padx=6, pady=6
     ).grid(**g(0, 0, columnspan=3, sticky="w"))
 
-    # 保存先
     tk.Label(win, text="保存先フォルダ:").grid(**g(1, 0, sticky="w"))
     save_dir_var = tk.StringVar(value=config["save_dir"])
     tk.Entry(win, textvariable=save_dir_var, width=42).grid(**g(1, 1, sticky="ew"))
@@ -339,12 +347,10 @@ def open_settings(icon):
 
     tk.Button(win, text="  参照  ", command=browse).grid(**g(1, 2))
 
-    # 接頭語
     tk.Label(win, text="接頭語:").grid(**g(2, 0, sticky="w"))
     prefix_var = tk.StringVar(value=config["prefix"])
     tk.Entry(win, textvariable=prefix_var, width=22).grid(**g(2, 1, sticky="w"))
 
-    # 出力形式
     tk.Label(win, text="出力形式:").grid(**g(3, 0, sticky="w"))
     format_var = tk.StringVar(value=config.get("format", "jpg"))
     fmt_frame = tk.Frame(win)
@@ -356,24 +362,20 @@ def open_settings(icon):
             indicatoron=True, padx=8, pady=6
         ).pack(side="left", padx=4)
 
-    # タイムスタンプ
     use_ts_var = tk.BooleanVar(value=config["use_timestamp"])
     tk.Checkbutton(
         win, text="タイムスタンプを使う（OFFで連番）",
         variable=use_ts_var, padx=6, pady=6
     ).grid(**g(4, 0, columnspan=2, sticky="w"))
 
-    # 連番桁数
     tk.Label(win, text="連番桁数:").grid(**g(5, 0, sticky="w"))
     digits_var = tk.IntVar(value=config["seq_digits"])
     tk.Spinbox(win, from_=1, to=10, textvariable=digits_var, width=6).grid(**g(5, 1, sticky="w"))
 
-    # 連番開始番号
     tk.Label(win, text="連番開始番号:").grid(**g(6, 0, sticky="w"))
     seq_var = tk.IntVar(value=config["seq_start"])
     tk.Spinbox(win, from_=0, to=99999, textvariable=seq_var, width=9).grid(**g(6, 1, sticky="w"))
 
-    # ホットキー
     tk.Label(win, text="── ホットキー設定 ──").grid(row=7, column=0, columnspan=3, pady=(12, 2))
     tk.Label(win, text="例: <ctrl>+<shift>+f", fg="gray", font=("", 8)).grid(row=8, column=0, columnspan=3)
 
@@ -411,8 +413,6 @@ def open_settings(icon):
 
     tk.Button(btn_frame, text="     OK     ", command=on_ok).pack(side="left", padx=12)
     tk.Button(btn_frame, text=" キャンセル ", command=win.destroy).pack(side="left", padx=12)
-
-    win.mainloop()
 
 
 def get_exe_path():
@@ -467,25 +467,31 @@ def main():
 
     icon_image = create_icon_image()
 
+    # メインループ用のtkルート（非表示）
+    root = tk.Tk()
+    root.withdraw()
+
     def do_fullscreen(icon, item):
         time.sleep(0.5)
-        capture_fullscreen()
+        threading.Thread(target=capture_fullscreen, daemon=True).start()
 
     def do_selected_window(icon, item):
-        time.sleep(2.0)
-        capture_selected_window()
+        def _run():
+            time.sleep(2.0)
+            capture_selected_window()
+        threading.Thread(target=_run, daemon=True).start()
 
     def do_rect(icon, item):
-        capture_rect()
+        threading.Thread(target=capture_rect, daemon=True).start()
 
     def do_open_folder(icon, item):
         os.startfile(config["save_dir"])
 
     def do_settings(icon, item):
-        threading.Thread(target=lambda: open_settings(icon), daemon=True).start()
+        root.after(0, lambda: open_settings(icon))
 
     def do_history(icon, item):
-        threading.Thread(target=show_clipboard_history, daemon=True).start()
+        root.after(0, show_clipboard_history)
 
     def startup_label(item):
         return "✅ スタートアップ登録済み" if is_startup_registered() else "🔁 スタートアップに登録"
@@ -506,16 +512,14 @@ def main():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(startup_label,              toggle_startup),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("❌ 終了",                  lambda icon, item: (icon.stop(), sys.exit(0))),
+        pystray.MenuItem("❌ 終了",                  lambda icon, item: (icon.stop(), root.quit())),
     )
 
-    icon = pystray.Icon(
-        "capdozo",
-        icon_image,
-        "キャプどうぞ",
-        menu,
-    )
-    icon.run()
+    icon = pystray.Icon("capdozo", icon_image, "キャプどうぞ", menu)
+
+    # pystrayを別スレッドで起動、tkのメインループをメインスレッドで回す
+    threading.Thread(target=icon.run, daemon=True).start()
+    root.mainloop()
 
 
 if __name__ == "__main__":
